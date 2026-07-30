@@ -2890,6 +2890,61 @@ class TestMessageStore:
         assert msg["role"] == "assistant"
         assert len(msg["tool_calls"]) == 1
 
+    def test_codex_provider_replay_round_trips_with_empty_visible_content(self, store):
+        reasoning = [{
+            "type": "reasoning",
+            "encrypted_content": "opaque-ciphertext",
+            "_issuer_kind": "codex_responses",
+        }]
+        message_items = [{
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [],
+        }]
+        sid = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_reasoning_items": reasoning,
+                "codex_message_items": message_items,
+            },
+        )
+
+        stored = store.get(sid)
+        replay = store.to_openai_msg(stored)
+
+        assert replay["content"] == ""
+        assert replay["codex_reasoning_items"] == reasoning
+        assert replay["codex_message_items"] == message_items
+        assert store._conn.execute(
+            "SELECT provider_replay FROM messages WHERE store_id = ?", (sid,)
+        ).fetchone()[0] is not None
+
+    def test_existing_message_database_adds_nullable_provider_replay_column(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            """CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT, tool_call_id TEXT, tool_calls TEXT,
+                tool_name TEXT, timestamp REAL NOT NULL, token_estimate INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0
+            )"""
+        )
+        connection.commit()
+        connection.close()
+
+        store = MessageStore(path)
+        try:
+            columns = {row[1] for row in store._conn.execute("PRAGMA table_info(messages)")}
+            assert "provider_replay" in columns
+            sid = store.append("sess", {"role": "user", "content": "legacy-compatible"})
+            assert store.get(sid)["content"] == "legacy-compatible"
+        finally:
+            store.close()
+
     def test_write_lock_serializes_concurrent_appends(self, tmp_path):
         """All writes through ``self._conn`` must serialize on ``self._write_lock``.
 

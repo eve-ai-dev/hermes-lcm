@@ -65,10 +65,26 @@ _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
     "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id, "
-    "ingested_at, observed_at, observed_at_source"
+    "ingested_at, observed_at, observed_at_source, provider_replay"
 )
+_PROVIDER_REPLAY_FIELDS = ("codex_reasoning_items", "codex_message_items")
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+
+def _serialize_provider_replay(message: Dict[str, Any]) -> str | None:
+    payload = {key: message[key] for key in _PROVIDER_REPLAY_FIELDS if message.get(key) is not None}
+    if not payload: return None
+    try: return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        logger.warning("LCM could not serialize provider replay metadata; preserving visible message only")
+        return None
+
+def _deserialize_provider_replay(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, str) or not value: return {}
+    try: payload = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError): return {}
+    if not isinstance(payload, dict): return {}
+    return {key: payload[key] for key in _PROVIDER_REPLAY_FIELDS if key in payload}
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -376,7 +392,8 @@ class MessageStore:
                 pinned INTEGER DEFAULT 0,
                 ingested_at REAL,
                 observed_at REAL,
-                observed_at_source TEXT
+                observed_at_source TEXT,
+                provider_replay TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_msg_session
                 ON messages(session_id, store_id);
@@ -396,6 +413,7 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        self._ensure_provider_replay_column()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -454,6 +472,10 @@ class MessageStore:
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
         )
 
+    def _ensure_provider_replay_column(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+        add_column_if_missing(self._conn, columns, "provider_replay", "ALTER TABLE messages ADD COLUMN provider_replay TEXT")
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
@@ -476,8 +498,8 @@ class MessageStore:
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    observed_at, observed_at_source, provider_replay)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -493,6 +515,7 @@ class MessageStore:
                     ingested_at,
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
+                    _serialize_provider_replay(msg),
                 ),
             )
             self._conn.commit()
@@ -544,8 +567,8 @@ class MessageStore:
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_at, observed_at_source, provider_replay)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
@@ -561,6 +584,7 @@ class MessageStore:
                         ts,
                         observed_at,
                         "host_message_timestamp" if observed_at is not None else None,
+                        _serialize_provider_replay(msg),
                     ),
                 )
                 ids.append(cur.lastrowid)
@@ -1374,7 +1398,7 @@ class MessageStore:
                 rows = self._conn.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              m.ingested_at, m.observed_at, m.observed_at_source,
+                              m.ingested_at, m.observed_at, m.observed_at_source, m.provider_replay,
                               rank as search_rank,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
@@ -1679,10 +1703,11 @@ class MessageStore:
         cols = [
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
-            "ingested_at", "observed_at", "observed_at_source",
+            "ingested_at", "observed_at", "observed_at_source", "provider_replay",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))
+        d.update(_deserialize_provider_replay(d.pop("provider_replay", None)))
         d["conversation_id"] = _normalize_conversation_id_value(d.get("conversation_id"))
         # Deserialize tool_calls JSON
         if d.get("tool_calls"):
@@ -1703,6 +1728,9 @@ class MessageStore:
             msg["tool_call_id"] = stored["tool_call_id"]
         if stored.get("tool_name"):
             msg["name"] = stored["tool_name"]
+        for key in _PROVIDER_REPLAY_FIELDS:
+            if key in stored:
+                msg[key] = stored[key]
         return msg
 
     # -- Connection access --------------------------------------------------
